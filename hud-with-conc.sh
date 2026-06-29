@@ -150,13 +150,12 @@ if not last:
 tot = (last.get("input_tokens", 0) + last.get("cache_creation_input_tokens", 0)
        + last.get("cache_read_input_tokens", 0) + last.get("output_tokens", 0))
 pct = int(round(tot * 100.0 / mx)) if mx else 0
-W = 8                                 # 进度条格数; 1/8 块补一格做亚像素过渡
-units = max(0, int(round(pct / 100.0 * W * 8)))
-full = min(units // 8, W)
-filled = "█" * full              # █
-if units % 8 and full < W:
-    filled += "▏▎▍▌▋▊▉"[units % 8 - 1]   # ▏..▉
-track = "░" * max(0, W - len(filled))   # ░
+W = 8                                 # 进度条格数
+# 四舍五入到整格, 不用 1/8 块做亚像素: fg-only 进度条里低占比的 ▏(1/8) 单元
+# 7/8 是背景色, 会在 ███ 与 ░░░░ 之间形成一道黑缝
+full = max(0, min(W, int(pct / 100.0 * W + 0.5)))
+filled = "█" * full                   # █
+track = "░" * (W - full)              # ░
 def human(n):                            # 80000->80k  80500->80.5k  1000000->1M
     if n >= 1000000:
         s = "%.1f" % (n / 1000000.0); return s.rstrip("0").rstrip(".") + "M"

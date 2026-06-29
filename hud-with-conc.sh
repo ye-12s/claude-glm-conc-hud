@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────
 # 状态栏: 仿 ~/.zshrc 的 Powerlevel10k 提示符
-#   目录 (dir) | git 分支状态 (vcs) | 模型 | GLM 并发 | 时间
+#   目录 (dir) | git 分支状态 (vcs) | 模型 | 上下文 | GLM 并发 | 时间
 #
 # stdin : Claude Code 传入的 session JSON
 # 配色  : 取自 ~/.p10k.zsh —— dir FG=31 / anchor=39; git 干净=绿 脏=黄
@@ -19,12 +19,19 @@ try:
 except Exception:
     pass
 cwd = (d.get("workspace") or {}).get("current_dir") or d.get("cwd") or ""
-model = (d.get("model") or {}).get("display_name") or ""
+_m = d.get("model") or {}
+model = _m.get("display_name") or ""
+mid   = _m.get("id") or ""
+ts = d.get("transcript_path") or ""        # 会话 transcript JSONL, 供算上下文用量
 print(cwd)
 print(model)
+print(mid)
+print(ts)
 ' 2>/dev/null)
 cwd="${_p[0]:-$PWD}"
 model="${_p[1]:-claude}"
+model_id="${_p[2]:-}"
+transcript="${_p[3]:-}"
 
 # ── 调色板 (256 色, 与 p10k 一致) ──
 R=$'\033[0m'
@@ -43,6 +50,8 @@ ICO_DIR=$''   #  folder
 ICO_GIT=$''   #  git branch (与 POWERLEVEL9K_VCS_BRANCH_ICON 一致)
 ICO_MODEL=$'' #  microchip
 ICO_CLOCK=$'' #  clock
+
+ICO_CTX=$''    #  bar chart (上下文用量, 参考 claude-hud)
 
 # ── 目录段: $HOME→~, 末段高亮, 过长则截断为 …/末段 ──
 fmt_dir() {
@@ -88,16 +97,95 @@ fmt_conc() {
   fi
 }
 
+# ── 上下文段: 进度条显示当前上下文占用 (参考 claude-hud) ──
+# 用量 = input + cache_creation + cache_read + output (cache_read 是缓存命中的历史 prompt, 同样占窗口)
+# 窗口总量动态识别, 不写死: 优先解析 model id/display_name/ANTHROPIC_*_MODEL 里的
+#   [1m]/[200k]/[128k] 后缀 (Claude Code 用它标注上下文窗口变体, 如 glm-5.2[1M]); 匹配不到再用
+#   已知模型前缀表, 最后兜底 200k
+fmt_ctx() {
+  [ -z "$transcript" ] && return 0
+  [ -f "$transcript" ] || return 0
+  local filled track pct used win col
+  IFS=: read -r filled track pct used win < <(TSCRIPT="$transcript" MID="$model_id" MNAME="$model" python3 -c '
+import os, sys, json, re
+path = os.environ.get("TSCRIPT", "")
+mid, mname = os.environ.get("MID", ""), os.environ.get("MNAME", "")
+def ctx_window():
+    # 1) [1m] / [200k] / [128k] 上下文后缀 (如 glm-5.2[1M] -> 1,000,000)
+    cands = [mid, mname] + [os.environ.get(k, "") for k in
+              ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+               "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+               "ANTHROPIC_DEFAULT_HAIKU_MODEL")]
+    for s in cands:
+        m = re.search(r"\[(\d+(?:\.\d+)?)([km])\]", s or "", re.I)
+        if m:
+            n = float(m.group(1)); u = m.group(2).lower()
+            return int(n * (1000 if u == "k" else 1000000))
+    # 2) 已知模型前缀 -> 上下文窗口
+    t = (mid or mname).lower()
+    for k, v in (("claude", 200000), ("glm-4.6", 200000), ("glm-4.5", 128000)):
+        if t.startswith(k):
+            return v
+    return 200000                     # 未知 -> 兜底 200k
+mx = ctx_window()
+last = None
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if "\"usage\"" not in line:
+                continue              # 跳过无 usage 的行 (大的 tool 结果等), 加速扫描
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            m = o.get("message") or {}
+            if m.get("role") == "assistant":
+                u = m.get("usage") or {}
+                if u:
+                    last = u          # 取最后一条 assistant usage (最近一次 API 响应)
+except Exception:
+    pass
+if not last:
+    sys.exit()                        # 暂无 assistant 回复 -> 该段不显示
+tot = (last.get("input_tokens", 0) + last.get("cache_creation_input_tokens", 0)
+       + last.get("cache_read_input_tokens", 0) + last.get("output_tokens", 0))
+pct = int(round(tot * 100.0 / mx)) if mx else 0
+W = 8                                 # 进度条格数; 1/8 块补一格做亚像素过渡
+units = max(0, int(round(pct / 100.0 * W * 8)))
+full = min(units // 8, W)
+filled = "█" * full              # █
+if units % 8 and full < W:
+    filled += "▏▎▍▌▋▊▉"[units % 8 - 1]   # ▏..▉
+track = "░" * max(0, W - len(filled))   # ░
+def human(n):                            # 80000->80k  80500->80.5k  1000000->1M
+    if n >= 1000000:
+        s = "%.1f" % (n / 1000000.0); return s.rstrip("0").rstrip(".") + "M"
+    if n >= 1000:
+        s = "%.1f" % (n / 1000.0);    return s.rstrip("0").rstrip(".") + "k"
+    return str(n)
+print("%s:%s:%d:%s:%s" % (filled, track, pct, human(tot), human(mx)))
+' 2>/dev/null)
+  [ -z "$pct" ] && return 0
+  if   [ "$pct" -ge 80 ] 2>/dev/null; then col="$C_RED"     # 接近满, 该 /compact 了
+  elif [ "$pct" -ge 50 ] 2>/dev/null; then col="$C_YEL"
+  else                                      col="$C_GREEN"
+  fi
+  # 进度条 (满段按阈值上色, 空槽暗色) + 用量/总量
+  printf '%s%s %s%s%s%s %s%s%s%s/%s%s' \
+    "$col" "$ICO_CTX" "$filled" "$DIM" "$track" "$R" "$col" "$used" "$R" "$DIM" "$win" "$R"
+}
+
 # ── 组装各段, 用暗色分隔符连接 ──
 SEP="${DIM} | ${R}"
 seg_dir=$(printf '%s %s' "$ICO_DIR" "$(fmt_dir "$cwd")")
 seg_git=$(fmt_git "$cwd")
 seg_model=$(printf '%s %s%s%s' "$C_MODEL" "$ICO_MODEL" " $model" "$R")
+seg_ctx=$(fmt_ctx)
 seg_conc=$(fmt_conc)
 seg_time=$(printf '%s %s%s' "$DIM" "$ICO_CLOCK" "$(date +%H:%M)${R}")
 
 out=""
-for seg in "$seg_dir" "$seg_git" "$seg_model" "$seg_conc" "$seg_time"; do
+for seg in "$seg_dir" "$seg_git" "$seg_model" "$seg_ctx" "$seg_conc" "$seg_time"; do
   [ -z "$seg" ] && continue
   [ -z "$out" ] && out="$seg" || out="${out}${SEP}${seg}"
 done
